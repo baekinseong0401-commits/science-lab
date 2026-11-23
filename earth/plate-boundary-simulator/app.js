@@ -20,6 +20,8 @@ const showArrows = $("showArrows");
 const showLabels = $("showLabels");
 const showQuakes = $("showQuakes");
 const showMagma = $("showMagma");
+const showChamber = $("showChamber");
+const showSea = $("showSea");
 const showPlates = $("showPlates");
 const showMantle = $("showMantle");
 const showBoundary = $("showBoundary");
@@ -522,6 +524,8 @@ const U = {
   uT: { value: 0 },
   uMode: { value: 0 },
   uMagma: { value: 1 },
+  uChamber: { value: 1 },
+  uSea: { value: 1 },
   uFlow: { value: 1 },
   uOutline: { value: 1 },
   uOverlay: { value: 0 },
@@ -555,6 +559,13 @@ vec2 pb_vor(vec2 x){ vec2 n=floor(x), f=fract(x); float F1=8., F2=8.;
   F1=sqrt(F1); F2=sqrt(F2); return vec2(F1,F2-F1); }
 vec3 pb_lin(vec3 c){ return pow(max(c,vec3(0.)),vec3(2.2)); }
 float pb_trDisp(float x, float slip, float def){ return sign(x)*slip*.5 + def*atan(x/FAULT_D)/3.14159265; }
+// 발산형: 판 사이 틈으로 마그마가 상승하는 주기 (단면·윗면이 같은 시계를 쓴다)
+// 해령 축 전체에서 한꺼번에 올라오고, 해저에 닿으면 축을 따라 동시에 갈라진다.
+#define RISE_P 6.0
+float pb_risePh(float t){ return fract(t/RISE_P); }
+float pb_riseFront(float ph){ return pb_ss(0.,.36,ph); }                    // 마그마 선단 높이 0→1
+float pb_riseOpen(float ph){ return pb_ss(.34,.42,ph)*(1.-pb_ss(.80,.97,ph)); } // 해저가 갈라진 정도
+float pb_riseHeat(float ph){ return 1.-pb_ss(.60,.90,ph); }                  // 식기 전 뜨거운 정도
 `;
 
 /* ---------- 지형(윗면) 재질 ---------- */
@@ -567,13 +578,13 @@ const terrainMat = new THREE.MeshStandardMaterial({
   envMapIntensity: 0.55
 });
 terrainMat.onBeforeCompile = (sh) => {
-  for (const k of ["uTime", "uT", "uMode", "uOverlay", "uSlip", "uDef", "uQuakes", "uQMag", "uQuakeOn", "uMagma"]) sh.uniforms[k] = U[k];
+  for (const k of ["uTime", "uT", "uMode", "uOverlay", "uSlip", "uDef", "uQuakes", "uQMag", "uQuakeOn", "uMagma", "uSea"]) sh.uniforms[k] = U[k];
   sh.vertexShader = "varying vec3 vWP;\n" + sh.vertexShader.replace(
     "#include <worldpos_vertex>",
     "#include <worldpos_vertex>\n vWP = (modelMatrix * vec4(transformed, 1.0)).xyz;"
   );
   sh.fragmentShader =
-    "uniform float uTime, uT, uMode, uOverlay, uSlip, uDef, uQuakeOn, uMagma;\nuniform vec4 uQuakes[8];\nuniform float uQMag[8];\nvarying vec3 vWP;\n" +
+    "uniform float uTime, uT, uMode, uOverlay, uSlip, uDef, uQuakeOn, uMagma, uSea;\nuniform vec4 uQuakes[8];\nuniform float uQMag[8];\nvarying vec3 vWP;\n" +
     GLSL_HELPERS +
     sh.fragmentShader
       .replace("#include <color_fragment>", `#include <color_fragment>
@@ -595,12 +606,19 @@ terrainMat.onBeforeCompile = (sh) => {
           float edge = 1. - pb_ss(.006, .014, abs(abs(rz)-.135));
           diffuseColor.rgb = mix(diffuseColor.rgb, pb_lin(vec3(.85)), edge*road);
         }
-        if (uMode > .5 && uMode < 1.5) {
+        if (uMode > .5 && uMode < 1.5 && uSea > .5) {
           float sh = vWP.y;
           float wave = .5 + .5*sin(vWP.x*9. - uTime*1.6 + pb_noise(vWP.xz*3.)*4.);
           float foam = (1. - pb_ss(.0, .05, abs(sh + .015))) * pb_ss(.35, .75, pb_noise(vWP.xz*14. + uTime*.4)*wave + .3);
           diffuseColor.rgb *= mix(1., .7, (1. - pb_ss(-.01, .07, sh)) * pb_ss(-.08, -.0, sh) + (1.-pb_ss(0.,.06,sh))*step(0.,sh)*.6);
           diffuseColor.rgb = mix(diffuseColor.rgb, vec3(.92), foam*.85);
+        }
+        if (uMode < 0.5) {
+          // 마그마가 해저에 닿는 순간 열곡 바닥이 축을 따라 한꺼번에 갈라진다
+          float op = pb_riseOpen(pb_risePh(uTime)) * uMagma;
+          float cw = .02 + .07*op;
+          float crack = (1. - pb_ss(cw*.6, cw, abs(vWP.x))) * op;
+          diffuseColor.rgb = mix(diffuseColor.rgb, vec3(.02,.015,.012), crack);
         }
         if (uMode < 0.5 && uOverlay > 0.5) {
           // 고지자기 줄무늬 (해령 대칭)
@@ -611,7 +629,7 @@ terrainMat.onBeforeCompile = (sh) => {
         }
       }`)
       .replace("#include <opaque_fragment>", `
-      if (uMode < 1.5 && vWP.y < 0.) {
+      if (uMode < 1.5 && vWP.y < 0. && uSea > .5) {
         // 수심에 따른 빛 흡수 (얕은 해령은 밝고, 깊은 해저는 어둡다)
         float dep = -vWP.y;
         vec2 cp = vWP.xz*3.2 + vec2(uTime*.18, uTime*.11);
@@ -629,9 +647,16 @@ terrainMat.onBeforeCompile = (sh) => {
           totalEmissiveRadiance += vec3(1., .22, .12) * l * 1.6;
         }
         if (uMode < .5) {
-          // 열곡 중앙의 새 용암 틈
-          float fis = (1. - pb_ss(.02, .07, abs(vWP.x))) * pb_ss(.62, .85, pb_noise(vec2(vWP.z*2.4 - uTime*.15, 3.)));
-          totalEmissiveRadiance += vec3(1., .3, .05) * fis * uMagma * 1.6;
+          // 열곡 중앙의 용암 틈: 마그마가 축 전체에서 한꺼번에 올라와 해저가 동시에 갈라진다
+          // (앞뒤로 번져 가지 않도록 z 방향으로 흐르는 무늬는 쓰지 않는다)
+          float rph = pb_risePh(uTime);
+          float op = pb_riseOpen(rph), hot = pb_riseHeat(rph);
+          float cw = .02 + .07*op;
+          float crack = 1. - pb_ss(cw*.5, cw, abs(vWP.x));
+          float tex = .65 + .35*pb_noise(vec2(vWP.z*6., uTime*.8));
+          float flick = .88 + .12*sin(uTime*7.);
+          totalEmissiveRadiance += vec3(1., .32, .06) * crack * op * hot * tex * flick * uMagma * 2.6;
+          totalEmissiveRadiance += vec3(1., .3, .05) * (1. - pb_ss(.01, .04, abs(vWP.x))) * .2 * uMagma;
         }
         if (uMode > .5 && uMode < 1.5) {
           // 활화산 분화구 / 용암류
@@ -658,7 +683,7 @@ terrainMat.onBeforeCompile = (sh) => {
 
 /* ---------- 단면(측면) 셰이더 ---------- */
 const SECTION_FRAG = /* glsl */ `
-uniform float uTime, uT, uMode, uMagma, uFlow, uOutline, uSlip, uDef, uQuakeOn;
+uniform float uTime, uT, uMode, uMagma, uChamber, uFlow, uOutline, uSlip, uDef, uQuakeOn;
 uniform vec4 uQuakes[8];
 uniform float uQMag[8];
 uniform vec3 uLight;
@@ -721,13 +746,42 @@ void layDiv(float x,float y,float hs,inout vec3 col,inout float bh,inout vec3 em
   float mn=pb_noise(vec2(x*7.,y*5.-uTime*.7));
   em+=pb_lin(vec3(1.,.32,.06))*melt*(.15+.85*pb_ss(.45,.8,mn))*uMagma*1.4;
   col=mix(col,col*vec3(1.2,.8,.6),melt*.5*uMagma);
+  // 판 사이 틈으로 상승하는 마그마: 아래에서 위로 차오르고, 해저에 닿으면 갈라져 분출한 뒤 식는다
+  float lb0=axisTop-.55;                       // 해령 축의 암석권 바닥
+  float ph=pb_risePh(uTime);
+  float riseOn=1.-pb_ss(.33,.38,ph);           // 올라오는 중
+  float heat=pb_riseHeat(ph);
+  // 판 아래에 모인 마그마 (올라가기 직전에 부풀어 밝아진다)
+  float pre=max(pb_ss(.8,1.,ph),1.-pb_ss(0.,.12,ph));
+  float pe=length(vec2(x/.55,(y-(lb0-.3))/.36));
+  float pool=(1.-pb_ss(.55,1.,pe))*uChamber;     // 마그마 방을 끄면 함께 숨긴다
+  em+=magmaCol(vec2(x,y))*pool*(.35+.45*pre)*uMagma;
+  col=mix(col,vec3(.22,.06,.02),pool*.7*uMagma);
+  // 마그마 방 (설정의 '마그마 방 표시'로 따로 켜고 끈다)
   float cy=axisTop-.34;
-  float e=length(vec2(x,y-cy)/vec2(.55,.075)); float ch=1.-pb_ss(.75,1.,e);
-  float e2=length(vec2(x,y-cy+.25)/vec2(.95,.33)); float mush=(1.-pb_ss(.3,1.,e2))*(1.-ch);
-  float dk=(1.-pb_ss(.012,.035,abs(x-.025*sin(y*23.+uTime*.7))))*step(y,hs)*step(cy,y);
-  dk*=.5+.5*sin(uTime*1.1);
-  em+=magmaCol(vec2(x,y))*(ch+mush*.22+dk*.8)*uMagma;
+  float che=length(vec2(x,y-cy)/vec2(.55,.075)); float ch=(1.-pb_ss(.75,1.,che))*uChamber;
+  float e2=length(vec2(x,y-cy+.25)/vec2(.95,.33)); float mush=(1.-pb_ss(.3,1.,e2))*(1.-ch)*uChamber;
+  em+=magmaCol(vec2(x,y))*(ch+mush*.22)*uMagma;
   col=mix(col,vec3(.18,.05,.02),ch*uMagma);
+  // 판 사이 틈 (마그마가 밀고 올라온 만큼만 열린다)
+  float wob=.010*sin(y*19.+uTime*1.3)+.006*sin(y*41.-uTime*2.1);
+  float y0=lb0-.3;                             // 판 아래 마그마가 모인 곳에서 출발
+  float cw=.085+.03*pb_ss(lb0+.25,lb0-.1,y)+.06*pb_riseOpen(ph)*pb_ss(hs-.2,hs,y);
+  float slot=(1.-pb_ss(cw*.6,cw,abs(x-wob)))*step(y0,y)*step(y,hs);
+  float yf=mix(y0,hs+.01,pb_riseFront(ph));
+  float below=step(y,yf);
+  float fill=slot*below*mix(pb_ss(y0,y0+.22,y),1.,uChamber);  // 마그마 방이 없으면 부분 용융대에서 서서히 이어진다
+  float crackTip=slot*(1.-below)*(1.-pb_ss(0.,.1,y-yf))*riseOn;   // 선단 바로 위의 가는 균열
+  float tip=(1.-pb_ss(cw,cw*2.2,abs(x-wob)))*exp(-pb_sq((y-yf)/.04))*riseOn*step(y0,y);
+  float cooled=fill*(1.-heat)*(1.-pb_ss(.9,1.,ph));
+  col=mix(col,vec3(.05,.03,.03),crackTip*uMagma);
+  col=mix(col,vec3(.18,.05,.02),fill*heat*uMagma);
+  col=mix(col,vec3(.11,.11,.12),cooled*uMagma);
+  em+=magmaCol(vec2(x,y))*fill*heat*1.15*uMagma;
+  em+=vec3(1.,.82,.5)*tip*3.2*uMagma;
+  // 해저에 닿으면 축 위가 벌어지며 용암이 빛난다
+  float vent=(1.-pb_ss(.08,.26,abs(x)))*(1.-pb_ss(0.,.08,hs-y))*step(y,hs)*pb_riseOpen(ph)*heat;
+  em+=magmaCol(vec2(x,y))*vent*.9*uMagma;
   ol=max(ol,lineAt(y-lb));
   ol=max(ol,(1.-pb_ss(.0,.03,a))*step(lb,y)*step(fract(y*5.),.55)*step(y,hs));
 }
@@ -805,11 +859,11 @@ void layConv(float x,float y,float hs,inout vec3 col,inout float bh,inout vec3 e
       glow+=1.-pb_ss(rad*.25,rad,length(p-pos));
     }
     // 마그마 방 + 화도
-    float che=length((p-vec2(3.75,-1.4))/vec2(.62,.3)); float ch=1.-pb_ss(.8,1.,che);
+    float che=length((p-vec2(3.75,-1.4))/vec2(.62,.3)); float ch=(1.-pb_ss(.8,1.,che))*uChamber;
     float cx=3.72+.03*sin(y*6.+uTime*.3);
     float cond=(1.-pb_ss(.03,.055,abs(x-cx)))*step(-1.45,y)*step(y,hs);
     float sill=(1.-pb_ss(.03,.06,abs(y+.6-.2*(x-3.72))))*(1.-pb_ss(.0,.45,abs(x-3.95)))*step(3.72,x);
-    float mm=clamp(glow+ch+cond+sill*.8,0.,1.);
+    float mm=clamp(glow+ch+cond+sill*.8*uChamber,0.,1.);
     col=mix(col,vec3(.2,.05,.02),mm*uMagma);
     em+=magmaCol(p)*mm*uMagma;
     ol=max(ol,lineAt(y-lbc)*step(y,moho+.5)*(1.-pb_ss(-.05,.05,dn+.0)));
@@ -862,6 +916,9 @@ void main(){
       float pw=.05+max(0.,y-hs)*.25;
       float m=exp(-pb_sq(x/pw))*pb_noise(vec2(x*8.,y*5.-uTime*1.2))*pb_ss(0.,-.5,y);
       col=mix(col,vec3(.06,.06,.07),m*.65*uMagma);
+      // 분출 직후 열곡 위 바닷물에 비치는 붉은 빛
+      float rph=pb_risePh(uTime);
+      em+=vec3(1.,.35,.08)*exp(-pb_sq(x/.16))*exp(-max(0.,y-hs)*7.)*pb_riseOpen(rph)*pb_riseHeat(rph)*uMagma*.6;
     }
     sl=.85;
   }
@@ -1014,7 +1071,7 @@ water.renderOrder = 2;
 water.receiveShadow = true;
 scene.add(water);
 
-const hasWater = () => modeId !== 2;
+const hasWater = () => modeId !== 2 && showSea.checked;
 
 // 바닷물 옆면 (투명 물기둥: 해저면 ~ 해수면)
 const waterWallMat = new THREE.ShaderMaterial({
@@ -1296,6 +1353,7 @@ function updateLabels() {
   const w = canvas.clientWidth, h = canvas.clientHeight;
   for (const l of labels) {
     const p = l.fn();
+    if (!p) { l.el.style.opacity = 0; continue; }
     _v.set(p[0], p[1], p[2]).project(camera);
     const x = (_v.x * 0.5 + 0.5) * w;
     const y = (-_v.y * 0.5 + 0.5) * h;
@@ -1520,7 +1578,8 @@ function buildDivergent() {
   setLabels([
     ["해령 · 열곡", () => [0, divH(0, -3.4) + 0.1, -3.4]],
     ["새로운 해양 지각", () => [3.8, divBase(3.8) - 0.32, Z1]],
-    ["마그마 방", () => [0, divBase(0) - 0.34, Z1]],
+    ["판 틈으로 상승하는 마그마", () => showMagma.checked ? [-0.3, divBase(0) - 0.95, Z1] : null],
+    ["마그마 방", () => showMagma.checked && showChamber.checked ? [0.5, divBase(0) - 0.34, Z1] : null],
     ["부분 용융 (감압 용융)", () => [0, -4.3, Z1]],
     ["암석권 (판)", () => [-7, -3.2, Z1]],
     ["연약권", () => [5.5, -5.3, Z1]],
@@ -1580,7 +1639,7 @@ function buildConvergent() {
     ["화산호 (안데스형 산맥)", () => [VOLCANOES[1].x, convH(VOLCANOES[1].x, VOLCANOES[1].z) + 0.05, VOLCANOES[1].z]],
     ["섭입하는 해양판", () => [0.1, -3.85, Z1]],
     ["마그마 생성 (부분 용융)", () => [3.25, -3.75, Z1]],
-    ["마그마 방", () => [3.75, -1.2, Z1]],
+    ["마그마 방", () => showMagma.checked && showChamber.checked ? [3.75, -1.2, Z1] : null],
     ["대륙 지각", () => [7.6, -1.0, Z1]],
     ["연약권", () => [7.6, -5.0, Z1]],
     ["해양 지각", () => [-5.5, convOcean(-5.5) - 0.4, Z1]]
@@ -1628,7 +1687,7 @@ function buildTransform() {
 const INFO = {
   divergent: {
     title: "발산형 경계 — 해령",
-    text: "두 판이 서로 멀어지는 경계입니다. 판이 벌어진 틈으로 뜨거운 맨틀이 올라오면 압력이 낮아져 부분 용융(감압 용융)이 일어나고, 만들어진 마그마가 해령 아래 마그마 방에 모였다가 분출하여 새로운 해양 지각이 됩니다. 해령에서 멀어질수록 지각의 나이가 많아지고 퇴적물이 두꺼워지며, 판이 식어 무거워지므로 수심도 깊어집니다. 해령 중앙에는 열곡이 발달하고, 얕은 곳에서 지진과 화산 활동이 일어납니다. ‘경계선 · 고지자기 줄무늬’를 켜면 해령을 중심으로 대칭인 고지자기 줄무늬를 볼 수 있습니다."
+    text: "두 판이 서로 멀어지는 경계입니다. 판이 벌어진 틈으로 뜨거운 맨틀이 올라오면 압력이 낮아져 부분 용융(감압 용융)이 일어나고, 만들어진 마그마가 두 판 사이의 틈을 따라 해령 축 전체에서 올라와 해저를 가르고 분출하며, 식어서 새로운 해양 지각이 됩니다. 해령에서 멀어질수록 지각의 나이가 많아지고 퇴적물이 두꺼워지며, 판이 식어 무거워지므로 수심도 깊어집니다. 해령 중앙에는 열곡이 발달하고, 얕은 곳에서 지진과 화산 활동이 일어납니다. ‘경계선 · 고지자기 줄무늬’를 켜면 해령을 중심으로 대칭인 고지자기 줄무늬를 볼 수 있습니다."
   },
   convergent: {
     title: "수렴형 경계 — 섭입대",
@@ -1762,6 +1821,8 @@ function animate() {
   U.uTime.value = simTime;
   U.uT.value = T;
   U.uMagma.value = magma;
+  U.uChamber.value = showChamber.checked ? 1 : 0;
+  U.uSea.value = showSea.checked ? 1 : 0;
   U.uFlow.value = showMantle.checked ? 1 : 0;
   U.uOutline.value = showPlates.checked ? 1 : 0;
   U.uOverlay.value = showBoundary.checked ? 1 : 0;
@@ -1834,6 +1895,7 @@ function animate() {
    EVENTS
 ========================================================= */
 boundaryType.addEventListener("change", rebuild);
+showSea.addEventListener("change", () => { water.visible = hasWater(); updateTerrain(true); });
 
 // 전체화면 (Esc로 나가기 — 브라우저 기본 동작)
 const fsBtn = $("fsBtn");
